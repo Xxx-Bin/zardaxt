@@ -41,7 +41,7 @@ TCP_OPT_USRTO = 28 # User Timeout Option (also, other known unauthorized use) [*
 TCP_OPT_AUTH = 29 # TCP Authentication Option (TCP-AO)	[RFC5925]
 TCP_OPT_MULTIPATH = 30 # Multipath TCP (MPTCP)
 TCP_OPT_FASTOPEN = 34 # TCP Fast Open Cookie	[RFC7413]
-TCP_OPY_ENCNEG = 69 # Encryption Negotiation (TCP-ENO)	[RFC8547]
+TCP_OPT_ENCNEG = 69 # Encryption Negotiation (TCP-ENO)	[RFC8547]
 TCP_OPT_EXP1 = 253 # RFC3692-style Experiment 1 (also improperly used for shipping products) 
 TCP_OPT_EXP2 = 254 # RFC3692-style Experiment 2 (also improperly used for shipping products)
 
