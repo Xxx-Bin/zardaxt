@@ -4,6 +4,7 @@ from pypacker.layer3 import ip
 from pypacker.layer4 import tcp
 from pypacker import pypacker
 from datetime import datetime
+from datetime import timedelta
 import pcapy
 import getopt
 import time
@@ -21,7 +22,7 @@ from api import run_api
 Author: Nikolai Tschacher
 Website: incolumitas.com
 Date: March/April 2021
-Update: May/June 2022
+Update: August 2022
 
 Allows to fingerprint an incoming TCP/IP connection by the intial SYN packet.
 
@@ -33,22 +34,19 @@ However, the codebase of github.com/xnih/satori was quite frankly
 a huge mess (randomly failing code segments and capturing the errors, not good). 
 """
 
+# global variables
 classify = False
-writeAfter = 40
+writeAfter = 100
 # after how many classifications the data structure should be cleared
 # we have to reset in order to prevent memory leaks
 clearDictAfter = 3000
 interface = None
 verbose = False
 fingerprints = {}
-classifications = dict()
+timestamps = {}
+classifications = {}
 databaseFile = './database/combinedJune2022.json'
 dbList = []
-with open(databaseFile) as f:
-  dbList = json.load(f)
-
-log('Loaded {} fingerprints from the database'.format(len(dbList)), 'tcp_fingerprint')
-run_api(classifications)
 
 def makeOsGuess(fp, n=3):
   """
@@ -146,8 +144,7 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler) # ctlr + c
 signal.signal(signal.SIGTSTP, signal_handler) # ctlr + z
 
-
-def tcpProcess(pkt, layer, ts):
+def tcpProcess(pkt, layer, ts, packetReceived):
   """
   Understand this: https://www.keycdn.com/support/tcp-flags
 
@@ -173,84 +170,166 @@ def tcpProcess(pkt, layer, ts):
   # SYN (1 bit): Synchronize sequence numbers. Only the first packet sent from each
   # end should have this flag set. Some other flags and fields change meaning
   # based on this flag, and some are only valid when it is set, and others when it is clear.
-  if tcp1.flags & tcp.TH_SYN:
-    label = ''
-    if tcp1.flags & tcp.TH_SYN:
-      label = 'SYN'
-    if (tcp1.flags & tcp.TH_SYN) and (tcp1.flags & tcp.TH_ACK):
-      label = 'SYN+ACK'
 
-    if verbose:
-      log("%d: %s:%s -> %s:%s [%s]" % (ts, pkt[ip.IP].src_s, pkt[tcp.TCP].sport,
-          pkt[ip.IP].dst_s, pkt[tcp.TCP].dport, label), 'tcp_fingerprint')
+  is_syn = tcp1.flags & tcp.TH_SYN
+  is_ack = tcp1.flags & tcp.TH_ACK
 
-    # http://www.iana.org/assignments/ip-parameters/ip-parameters.xml
-    [ipVersion, ipHdrLen] = computeIP(ip4.v_hl)
+  label = ''
+  if is_syn and not is_ack:
+    label = 'SYN'
+  if is_syn and is_ack:
+    label = 'SYN+ACK'
+  if not is_syn and is_ack:
+    label = 'ACK'
 
-    # https://github.com/mike01/pypacker/blob/master/pypacker/layer3/ip.py
-    ip_off = None
-    if hasattr(ip4, 'off'):
-      ip_off = ip4.off
-    elif hasattr(ip4, 'frag_off'):
-      ip_off = ip4.frag_off
+  if verbose:
+    log("[%s] %d: %s:%s -> %s:%s" % (label, ts, pkt[ip.IP].src_s, pkt[tcp.TCP].sport,
+        pkt[ip.IP].dst_s, pkt[tcp.TCP].dport), 'tcp_fingerprint')
 
-    [df, mf, offset] = computeIPOffset(ip_off)
+  # http://www.iana.org/assignments/ip-parameters/ip-parameters.xml
+  [ipVersion, ipHdrLen] = computeIP(ip4.v_hl)
 
-    [tcpOpts, tcpTimeStamp, tcpTimeStampEchoReply, mss, windowScaling] = decodeTCPOptions(tcp1.opts)
+  # https://github.com/mike01/pypacker/blob/master/pypacker/layer3/ip.py
+  ip_off = None
+  if hasattr(ip4, 'off'):
+    ip_off = ip4.off
+  elif hasattr(ip4, 'frag_off'):
+    ip_off = ip4.frag_off
 
-    if verbose:
-      log('IP version={}, header length={}, TTL={}, df={}, mf={}, offset={}'.format(
-        ipVersion, ipHdrLen, ip4.ttl, df, mf, offset,
-      ), 'tcp_fingerprint')
-      log('TCP window size={}, flags={}, ack={}, header length={}, urp={}, options={}, time stamp={}, timestamp echo reply = {}, MSS={}'.format(
-        tcp1.win, tcp1.flags, tcp1.ack, tcp1.off_x2, tcp1.urp, tcpOpts, tcpTimeStamp, tcpTimeStampEchoReply, mss
-      ), 'tcp_fingerprint')
+  [df, mf, offset] = computeIPOffset(ip_off)
+
+  [tcpOpts, tcpTimeStamp, tcpTimeStampEchoReply, mss, windowScaling] = decodeTCPOptions(tcp1.opts)
+
+  if verbose:
+    log('[{}] IP version={}, header length={}, TTL={}, df={}, mf={}, offset={}'.format(
+      ipVersion, ipHdrLen, ip4.ttl, df, mf, offset, label
+    ), 'tcp_fingerprint')
+    log('[{}]TCP window size={}, flags={}, ack={}, header length={}, urp={}, options={}, time stamp={}, timestamp echo reply = {}, MSS={}'.format(
+      tcp1.win, tcp1.flags, tcp1.ack, tcp1.off_x2, tcp1.urp, tcpOpts, tcpTimeStamp, tcpTimeStampEchoReply, mss, label
+    ), 'tcp_fingerprint')
+    
+  if label == 'SYN':
+    key = '{}:{}'.format(pkt[ip.IP].src_s, pkt[tcp.TCP].sport)
+    fingerprints[key] = {
+      'packet_received': packetReceived,
+      'ts': ts,
+      'src_ip': pkt[ip.IP].src_s,
+      'dst_ip': '{}'.format(pkt[ip.IP].dst_s),
+      'src_port': '{}'.format(pkt[tcp.TCP].sport),
+      'dst_port': '{}'.format(pkt[tcp.TCP].dport),
+      'ip_hdr_length': ipHdrLen,
+      'ip_opts': ip4.opts,
+      'ip_ttl': ip4.ttl,
+      'ip_df': df,
+      'ip_mf': mf,
+      'ip_frag_off': ip_off,
+      'tcp_window_size': tcp1.win,
+      'tcp_flags': tcp1.flags,
+      'tcp_ack': tcp1.ack,
+      'tcp_seq': tcp1.seq,
+      'tcp_header_length': tcp1.off_x2, # tcp_data_offset
+      'tcp_urp': tcp1.urp,
+      'tcp_options': tcpOpts,
+      'tcp_window_scaling': windowScaling,
+      'tcp_timestamp': tcpTimeStamp,
+      'tcp_timestamp_echo_reply': tcpTimeStampEchoReply,
+      'tcp_mss': mss
+    }
+
+    # add tcp ts from syn packet
+    addTimestamp(key, packetReceived, tcpTimeStamp, tcpTimeStampEchoReply, tcp1.seq)
+
+    if classify:
+      classification = makeOsGuess(fingerprints[key])
+      if verbose:
+        pprint.pprint(classification)
+
+      classifications[pkt[ip.IP].src_s] = classification
+      log('Classified SYN packet from IP={} [{}/{}]'.format(
+        pkt[ip.IP].src_s,
+        len(classifications),
+        clearDictAfter), 'tcp_fingerprint')
+
+      if len(classifications) > clearDictAfter:
+        log('Clearing classifications dict', 'tcp_fingerprint')
+        classifications.clear()
+        fingerprints.clear()
+        timestamps.clear()
       
-    if label == 'SYN':
-      key = '{}:{}'.format(pkt[ip.IP].src_s, pkt[tcp.TCP].sport)
-      fingerprints[key] = {
-        'ts': ts,
-        'src_ip': pkt[ip.IP].src_s,
-        'dst_ip': '{}'.format(pkt[ip.IP].dst_s),
-        'src_port': '{}'.format(pkt[tcp.TCP].sport),
-        'dst_port': '{}'.format(pkt[tcp.TCP].dport),
-        'ip_hdr_length': ip4.v_hl,
-        'ip_opts': ip4.opts,
-        'ip_ttl': ip4.ttl,
-        'ip_df': df,
-        'ip_mf': mf,
-        'ip_frag_off': ip_off,
-        'tcp_window_size': tcp1.win,
-        'tcp_flags': tcp1.flags,
-        'tcp_ack': tcp1.ack,
-        'tcp_seq': tcp1.seq,
-        'tcp_header_length': tcp1.off_x2, # tcp_data_offset
-        'tcp_urp': tcp1.urp,
-        'tcp_options': tcpOpts,
-        'tcp_window_scaling': windowScaling,
-        'tcp_timestamp': tcpTimeStamp,
-        'tcp_timestamp_echo_reply': tcpTimeStampEchoReply,
-        'tcp_mss': mss
-      }
+    # update file once in a while
+    if len(fingerprints) > 0 and len(fingerprints) % writeAfter == 0:
+      updateFile()
 
-      if classify:
-        classification = makeOsGuess(fingerprints[key])
-        if verbose:
-          pprint.pprint(classification)
+  elif label == 'ACK':
+    # Here we take timestamp samples from the client. We only regard timestamps from 
+    # ACK segments from the client ---> server.
 
-        classifications[pkt[ip.IP].src_s] = classification
-        log('Classified SYN packet from IP={} [{}/{}]'.format(
-          pkt[ip.IP].src_s,
-          len(classifications),
-          clearDictAfter), 'tcp_fingerprint')
+    # RFC 1323 specifies timestamps must be monotonically increasing, and tick between 1 ms and 1 second.
+    # The starting value for the timestamp is not explicitly specified, however many network stack implementations
+    # use a systems uptime to calculate the timestamp. [https://floatingoctothorpe.uk/2018/detecting-uptime-from-tcp-timestamps.html]
 
-        if len(classifications) > clearDictAfter:
-          log('Clearing classifications dict', 'tcp_fingerprint')
-          classifications.clear()
-        
-      # update file once in a while
-      if len(fingerprints) > 0 and len(fingerprints) % writeAfter == 0:
-        updateFile()
+    # Read https://www.rfc-editor.org/rfc/rfc1323#section-4 in order to understand
+    # how TCP timestamps work. 
+
+    # We only take new timestamp samples, if the timestamp increases, otherwise
+    # there is no further information to extract from identical timestamps (I guess 
+    # this happens because TCP/IP stacks fire out segments with the same TCP timestamp)
+    # Most commonly, timestamps are in MS (millieseconds) (which means the frequency is 1000hz), but this is not always the case.
+
+    # If we managed to infer the frequency (hz) of at least two timestamps, we will infer the likely exact 
+    # frequency and then we compute the uptime. For most modern systems, uptime computation will be wrong:
+    # On Linux the TCP timestamp feature can be controlled with the net.ipv4.tcp_timestamp kernel parameter. Normally the option can either be enabled (1) or disabled (0), however more recent kernels also have an option to add a random offset which will effectively hide the systems uptime [https://floatingoctothorpe.uk/2018/detecting-uptime-from-tcp-timestamps.html]
+    key = '{}:{}'.format(pkt[ip.IP].src_s, pkt[tcp.TCP].sport)
+    # this line makes sure that we alrady got the initial SYN packet
+    if key in fingerprints:
+      addTimestamp(key, packetReceived, tcpTimeStamp, tcpTimeStampEchoReply, tcp1.seq)
+      tss = timestamps[key].get('timestamps', [])
+      ticks = timestamps[key].get('clock_ticks', [])
+      if len(tss) >= 2 and isInt(tss[-1]) and isInt(tss[0]):
+        delta_tcp_ts = tss[-1] - tss[0]
+        delta_clock = ticks[-1] - ticks[0]
+        hertz_observed = delta_tcp_ts / delta_clock
+        hertz = computeNearTimestampTick(hertz_observed)
+        fingerprints[key]['uptime_interpolation'] = {
+          'hz_observed': hertz_observed,
+          'hz': hertz,
+          'num_timestamps': len(tss),
+          # 'data': timestamps[key]
+        }
+        uptime = None
+        if isinstance(hertz, int):
+          uptime = tss[0] / hertz
+        else:
+          uptime = tss[0] / hertz_observed
+
+        if uptime:
+          fingerprints[key]['uptime_interpolation']['uptime'] = str(timedelta(seconds=uptime))
+
+
+def addTimestamp(key, packetReceived, tcp_timestamp, tcp_timestamp_echo_reply, tcp_seq):
+  if not key in timestamps:
+    timestamps[key] = {
+      'timestamps': [tcp_timestamp],
+      'timestamp_echo_replies' :[tcp_timestamp_echo_reply],
+      'clock_ticks': [packetReceived],
+      'seq_nums': [tcp_seq]
+    }
+  elif len(timestamps[key].get('timestamps', [])) <= 20:
+    timestamps[key]['timestamps'].append(tcp_timestamp)
+    timestamps[key]['timestamp_echo_replies'].append(tcp_timestamp_echo_reply)
+    timestamps[key]['clock_ticks'].append(packetReceived)
+    timestamps[key]['seq_nums'].append(tcp_seq)
+    tss = timestamps[key].get('timestamps', [])
+    ticks = timestamps[key].get('clock_ticks', [])
+    deltas = []
+    if len(tss) > 2:
+      for i in range(len(tss) - 1):
+        rtt = int(tss[i+1]) - int(tss[i])
+        real = ticks[i+1] - ticks[i]
+        deltas.append('rtt={}, clock={}'.format(rtt, real))
+
+    timestamps[key]['deltas'] = deltas
+
 
 
 def computeIP(info):
@@ -276,6 +355,37 @@ def computeNearTTL(ip_ttl):
     guessed_ttl_start = 255
 
   return guessed_ttl_start
+
+
+def isInt(test):
+  try:
+    int(test)
+    return True
+  except ValueError:
+    return False
+
+
+def computeNearTimestampTick(hertz_observed):
+  """
+  Guess what the TCP timestmap tick must have been from measurements
+
+  Theory: https://www.rfc-editor.org/rfc/rfc1323#section-4
+
+  So far, what I have seen in the wild is 1000hz, 250hz, 100hz and 10hz
+  """
+  if hertz_observed > 800 and hertz_observed < 1200:
+    return 1000
+
+  if hertz_observed > 240 and hertz_observed < 260:
+    return 250
+
+  if hertz_observed > 90 and hertz_observed < 110:
+    return 100
+
+  if hertz_observed > 5 and hertz_observed < 15:
+    return 10
+
+  return 'unknown'
 
 
 def computeIPOffset(info):
@@ -311,13 +421,13 @@ def usage():
     -n, --writeAfter  after how many SYN packets writing to the file""")
 
 def main():
-  #override some warning settings in pypacker.  May need to change this to .CRITICAL in the future, but for now we're trying .ERROR
-  #without this when parsing http for example we get "WARNINGS" when packets aren't quite right in the header.
+  # override some warning settings in pypacker.  May need to change this to .CRITICAL in the future, but for now we're trying .ERROR
+  # without this when parsing http for example we get "WARNINGS" when packets aren't quite right in the header.
   logger = pypacker.logging.getLogger("pypacker")
   pypacker.logger.setLevel(pypacker.logging.ERROR)
 
   counter = 0
-  startTime = time.time()
+  startTime = time.perf_counter()
 
   log('listening on interface {}'.format(interface), 'tcp_fingerprint')
 
@@ -333,6 +443,7 @@ def main():
       counter = counter + 1
       (header, buf) = preader.next()
       ts = header.getts()[0]
+      packetReceived = time.perf_counter()
 
       tcpPacket = False
       pkt = None
@@ -357,7 +468,7 @@ def main():
           tcpPacket = True
 
       if tcpPacket and pkt and layer:
-        tcpProcess(pkt, layer, ts)
+        tcpProcess(pkt, layer, ts, packetReceived)
 
     except (KeyboardInterrupt, SystemExit):
       raise
@@ -365,12 +476,14 @@ def main():
       error_string = traceback.format_exc()
       log(str(error_string), 'tcp_fingerprint', level='ERROR')
 
-  endTime = time.time()
+  endTime = time.perf_counter()
   totalTime = endTime - startTime
 
   if verbose:
     log('Total Time: %s, Total Packets: %s, Packets/s: %s' % (totalTime, counter, counter / totalTime ), 'tcp_fingerprint')
 
+
+# program entry point
 try:
   opts, args = getopt.getopt(sys.argv[1:], "i:v:c:", ['interface=', 'verbose', 'classify'])
   proceed = False
@@ -387,6 +500,13 @@ try:
       writeAfter = int(val)
 
   if (__name__ == '__main__') and proceed:
+    # load fingerprints into database
+    with open(databaseFile) as f:
+      dbList = json.load(f)
+    log('Loaded {} fingerprints from the database'.format(len(dbList)), 'tcp_fingerprint')
+    # run the API thread
+    run_api(classifications)
+    # run PCAP loop
     main()
   else:
     log('Need to provide a pcap to read in or an interface to watch', 'tcp_fingerprint')
